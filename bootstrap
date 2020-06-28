@@ -1,0 +1,519 @@
+#!/bin/sh
+# vim: foldmethod=marker foldmarker={,}
+#
+# Documentation {
+#
+# Manpage {
+# NAME:
+#      bootstrap
+#
+# SYNOPSIS:
+#     bootstrap [OPTION]
+#         (see print_help() below for more)
+#
+# DESCRIPTION:
+#     Basic single machine deployment system.
+#
+#     Capable of:
+#         - Installing the headless Dropbox client, with the
+#           Python CLI and systemd service
+#         - Creating directories
+#         - Creating symbolic links
+#         - Installing packages (supports apt).
+#           Packages are installed using 'sudo' and assume that
+#           all prompts are accepted
+#         - Cloning source repositories (supports Github repositories).
+#           Optionally runs a set of ; separated commands in the
+#           cloned repository
+#
+#     See the example INI file for syntax examples
+#
+# REQUIREMENTS:
+#     - getopts
+#     - curl or wget (installs curl if necessary)
+#     - apt-get (to install packages)
+#     - git (to install git repos; installed if necessary)
+#
+# BUGS:
+#     - Doesn't handle spaces in directory or link target
+#
+# TODO:
+#    - Run arbitrary code and/or local scripts (would allow things like
+#      installing Virtualbox Guest Additions)
+#    - Clean up output messages: what is an error, what is normal, what
+#      is verbose?
+#    - Add a force option to overwrite links only
+#}
+print_help () {
+    cat << END
+Usage: bootstrap [OPTION]
+Conduct simple, single machine deployment.
+
+  -n=HOST       use HOST as the hostname
+  -d=DIRECTORY  install to DIRECTORY instead of $HOME
+  -b=DIRECTORY  install binaries to DIRECTORY instead of bin
+                 (relative to $HOME or -d=DIRECTORY)
+  -r=DIRECTORY  Install source repositories to DIRECTORY instead
+                 of src (relative to $HOME or -d=DIRECTORY)
+  -p=DIRECTORY  install vim plugins to DIRECTORY instead of
+                .vim/pack/plugins/start (relative to $HOME or
+                -d=DIRECTORY)
+  -i=FILE       use FILE instead of bootstrap.ini as the
+                 configuration file
+  -e            print an example configuration file
+  -D            install Dropbox
+  -V            explain what is being done
+  -h            display this help and exit
+  -v            output version information and exit
+END
+}
+print_version () {
+    cat << END
+bootstrap 1.0
+Copyright (C) 2018 Jeremy Brubaker
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/license.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+END
+}
+print_example () {
+    cat << "END"
+# The 'common' section is always executed
+#
+# All relative paths are relative to DESTDIR
+# which defaults to $HOME.
+[common]
+    dir: bin # Create bin
+    dir: src lib share # Create src, lib and share
+    dir: documents/local # Create documents/local
+    link: Dropbox/src src # Create a symlink named src
+                          # pointing to Dropbox/src
+    pkg: git # Install git package. Requires apt-get
+    pkg: tmux screen # Install tmux and screen
+
+    # repo: syntax is:
+    #     repo: <type>, <url>, [commands]
+    #     <type> must be git (no other types are currently supported)
+    #     [commands] is optional. It is passed directly to the shell
+    #     and executed within the repo directory
+    #
+    # This command will clone the given repo in SRCDIR
+    # (defaults to DESTDIR/src), cd into the repo and execute
+    # 'make install'
+    repo: git, https://github.com/USER/repo, make install
+
+    # vimplug: syntax is:
+    #     vimplug: <type>, <url>
+    #     <type> must be git (no other types are currently supported)
+    #
+    # This command will clone the given repo in VIMPLUGDIR
+    # (defaults to DESTDIR/.vim/pack/plugins/start)
+    vimplug: git, https://github.com/USER/repo
+
+# This section is only executed if current
+# hostname is 'myhost'
+[myhost]
+    dir: dev
+    pkg: build-essential
+
+# This section is only executed if current
+# hostname is 'anotherhost'
+[anotherhost]
+    pkg: a_pkg
+END
+}
+#}
+logmsg () {
+    # Output messages
+    #
+    # Depends on $VERBOSE
+
+    test $VERBOSE = 'yes' && echo "$*"
+}
+logerror () {
+    # Output error messages
+
+    echo "$*" >&2
+}
+get_pkg_install_cmd () {
+    # Return command to install packages
+    #
+    # Supports: apt
+    #
+    # Return '' if no supported command found
+
+    if type apt > /dev/null 2>&1; then
+        test "$VERBOSE" = 'no' && quiet='-q'
+        echo "sudo apt-get install --assume-yes $quiet"
+    else
+        echo # no command found
+    fi
+}
+get_download_cmd () {
+    # Return command to download via HTTP
+    #
+    # Supports: wget, curl
+    #
+    # Depends on: $VERBOSE, $INSTALLPKG
+    #
+    # Attempts to install curl (using sudo) if necessary.
+    # Returns '' if no supported command is found
+
+    if type wget > /dev/null 2>&1; then
+        x='wget'
+    elif type curl >/dev/null 2>&1; then
+        x='curl'
+    else
+        logerror "Could not find wget or curl. Installing curl..."
+        if ! $INSTALLPKG curl; then
+            logerror "ERROR: Failed to install curl."
+            x='none'
+        else
+            x='curl'
+        fi
+    fi
+
+    case $x in
+        'wget')
+            test $VERBOSE = 'yes' && show_prog='--show-progress'
+            echo "wget -q $show_prog -O -"
+            ;;
+        'curl')
+            test $VERBOSE = 'no' && quiet='-s -S'
+            echo "curl $quiet -#"
+            ;;
+        *)
+            echo
+            ;;
+    esac
+}
+install_dropbox () {
+    # Install headless Dropbox client, Python CLI and systemd service
+    #
+    # Depends on: $DOWNLOAD, $DESTDIR, $BINDIR
+
+    logmsg "Installing Dropbox..."
+
+    # Skip if we can't download stuff
+    if test -z "$DOWNLOAD"; then
+        logerror "ERROR: Don't know how to download files. Skipping Dropbox install."
+        return
+    fi
+
+    # Skip if already installed
+    if test -e $DESTDIR/.dropbox-dist; then
+        logmsg "Dropbox is already installed."
+        return
+    fi
+
+    dropbox_url="https://www.dropbox.com/download?plat=lnx.x86_64"
+    dropbox_cli_url="https://www.dropbox.com/download?dl=packages/dropbox.py"
+    dropbox_client=".dropbox-dist/dropboxd"
+
+    logmsg "Installing Dropbox client..."
+    $DOWNLOAD $dropbox_url | tar xzf -
+
+    # Start the Dropbox client so the user can link the account
+    # Once the user presses ENTER (hopefully after successfully
+    # linking the account), kill the client and continue execution
+    #
+    echo "####################################################################"
+    echo "Starting Dropbox. Copy the link into a browser to link your account."
+    echo "   Type DONE and press ENTER once the Dropbox client says you have"
+    echo "                  successfully linked your account"
+    echo "             Press ENTER to continue starting Dropbox."
+    echo "####################################################################"
+
+    read k
+
+    $dropbox_client &
+
+    # Wait until user has linked the account
+    while read k; do
+        test "$k" = 'DONE' && break
+    done
+    kill $! # Kill client
+
+    # Install Dropbox CLI
+    if ! test -f "$DESTDIR/$BINDIR/dropbox.py"; then
+        logmsg "Installing Dropbox CLI..."
+        mkdir -p "$DESTDIR/$BINDIR" # Just in case
+        $DOWNLOAD $dropbox_cli_url > "$DESTDIR/$BINDIR/dropbox.py"
+        chmod u+x "$DESTDIR/$BINDIR/dropbox.py"
+    fi
+
+    logmsg "Installing Dropbox service..."
+    if [ ! -e /etc/systemd/system/dropbox@.service ]; then
+        cat <<SVC_END | sudo tee /etc/systemd/system/dropbox@.service >/dev/null #{
+# Copyright (c) 2015, Joe Roback
+# All rights reserved.
+# https://github.com/joeroback/dropbox
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+[Unit]
+Description=Dropbox as a system service
+After=local-fs.target network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env "/home/%i/.dropbox-dist/dropboxd"
+Restart=on-failure
+RestartSec=1
+User=%i
+
+[Install]
+WantedBy=multi-user.target
+SVC_END
+#}
+        sudo systemctl enable dropbox@$(whoami)
+        sudo systemctl start dropbox@$(whoami)
+    fi
+}
+# Process options {
+#
+# Flag Variables
+#
+HOST=$( hostname )
+DESTDIR="$HOME"
+BINDIR="bin"
+REPODIR="src"
+VIMPLUGDIR=".vim/pack/plugins/start"
+INIFILE="$( pwd )/bootstrap.ini"
+INSTALLDROPBOX='no'
+VERBOSE='no'
+
+while getopts 'n:d:b:r:p:i:eDVhv' opt; do
+    case $opt in
+        'n') HOST=$OPTARG ;;
+        'd') DESTDIR=$OPTARG ;;
+        'b') BINDIR=$OPTARG ;;
+        'r') REPODIR=$OPTARG ;;
+        'p') VIMPLUGDIR=$OPTARG ;;
+        'i') INIFILE=$OPTARG ;;
+        'e') print_example; exit ;;
+        'D') INSTALLDROPBOX='yes' ;;
+        'V') VERBOSE='yes' ;;
+        'h') print_help; exit ;;
+        'v') print_version; exit ;;
+        *)   print_help; exit ;;
+    esac
+done
+# }
+# Prep variables and locations and install Dropbox {
+if ! test -e "$INIFILE" && ! test -L "$INIFILE"; then
+    logerror "FATAL: $INIFILE not found. Exiting!"
+    exit 1
+fi
+
+for d in "$DESTDIR" "$DESTDIR/$BINDIR" "$DESTDIR/$REPODIR" "$DESTDIR/$VIMPLUGDIR"; do
+    if ! test -e "$d" && ! mkdir -p "$d"; then
+        logerror "FATAL: Could not create $d. Exiting!"
+        exit 1
+    fi
+done
+
+logmsg "Installing into $DESTDIR."
+logmsg "Installing scripts into $BINDIR."
+logmsg "Installing source repositories into $REPODIR."
+logmsg "Installing vim plugins into $VIMPLUGDIR."
+
+INSTALLPKG=$( get_pkg_install_cmd) # How to install packages
+if test -z "$INSTALLPKG"; then
+    logerror "WARNING: Couldn't find a way to install packages."
+else
+    logmsg "Using <$INSTALLPKG> to install packages."
+fi
+
+DOWNLOAD=$( get_download_cmd ) # How to download files
+if test -z "$DOWNLOAD"; then
+    logerror "WARNING: Couldn't find a way to download files."
+else
+    logmsg "Using <$DOWNLOAD> to download files"
+fi
+
+if test $INSTALLDROPBOX = 'yes'; then
+    install_dropbox
+fi
+# }
+# Process ini file {
+dodir () {
+    if test -n "$1"; then
+        echo "mkdir -p $1"
+    else
+        echo # No directory specified
+    fi
+}
+dolink () {
+    set $(echo "$1")
+    if test $# -ge 2; then
+        echo "ln -s $1 $2"
+    else
+        echo # Not enough arguments
+    fi
+}
+dorepo () {
+    # Process a 'repo:' directive
+    #
+    # Depends on: $DESTDIR, $REPODIR, $INSTALLPKG
+    #
+    # Supports: git
+
+    # Split on commas and set $1, $2, etc
+    local IFS=','
+    set $(echo "$1" | sed 's/^\s*//' )
+    if test $# -lt 2; then
+        echo # Don't have at least a type and URL
+        return
+    fi
+
+    local type=$1
+    local repo=$2
+    local reponame=$( echo $repo | sed -e 's@.*/@@' | sed -e 's/\.git$//' )
+
+    # What type of repo is it?
+    case $type in
+        'git')
+            # Return '' if git not installed
+            if ! type git > /dev/null 2>&1; then
+                logerror "git is required to install $repo. Installing git..."
+                if test -z "$INSTALLPKG" || ! eval "$INSTALLPKG git"; then
+                    logerror "ERROR: Failed to install git"
+                    return
+                fi
+            fi
+            echo -n "(cd $DESTDIR/$REPODIR; git clone $repo >/dev/null"
+            ;;
+        *)
+            logerror "WARNING: Unknown repo type <$type>. Skipping <$repo>."
+            return
+            ;;
+    esac
+
+    # Already used the first two parameters
+    # so the rest is assumed to be the build/install command
+    shift 2
+    echo "; cd $reponame; $*)"
+}
+dovimplug () {
+    # Process a 'vimplug:' directive
+    #
+    # Depends on: $DESTDIR, $VIMPLUGDIR, $INSTALLPKG
+    #
+    # Supports: git
+
+    # Split on commas and set $1, $2, etc
+    local IFS=','
+    set $(echo "$1" | sed 's/^\s*//' )
+    if test $# -lt 2; then
+        echo # Don't have at least a type and URL
+        return
+    fi
+
+    local type=$1
+    local repo=$2
+
+    # What type of repo is it?
+    case $type in
+        'git')
+            # Return '' if git not installed
+            if ! type git > /dev/null 2>&1; then
+                logerror "git is required to install $repo. Installing git..."
+                if test -z "$INSTALLPKG" || ! eval "$INSTALLPKG git"; then
+                    logerror "ERROR: Failed to install git"
+                    return
+                fi
+            fi
+            echo -n "(cd $DESTDIR/$VIMPLUGDIR; git clone $repo >/dev/null)"
+            ;;
+        *)
+            logerror "WARNING: Unknown repo type <$type>. Skipping <$repo>."
+            return
+            ;;
+    esac
+}
+dopkg () {
+    # Process a 'pkg:' directive
+    #
+    # Depends on: $INSTALLPKG
+
+    if test -z "$1"; then
+        echo # No package given
+        return
+    fi
+
+    # Return '' if we don't know how to install packages
+    if test -z "$INSTALLPKG"; then
+        logerror "WARNING: Don't know how to install packages. Skipping <$1>."
+        echo ''
+        return
+    fi
+
+    echo "$INSTALLPKG $1 >/dev/null"
+}
+#
+# Process the file and collect a list of commands to execute
+# This allows the script to fail if necessary, prior to
+# executing anything
+#
+
+logmsg "Processing INI file $INIFILE..."
+process=0 # = 1 if in a section to process
+to_exec=  # Put commands to execute here
+
+while read line; do
+    line=$( echo "$line" | sed 's/#.*$//' ) # Delete comments
+    test -z "$line" && continue # Skip blank lines
+
+    case "$line" in
+        \[common\]) process=1; continue ;; # Common section
+        \[$HOST\])  process=1; continue ;; # Our host
+        \[*\])      process=0; continue ;; # Another host
+    esac
+
+    # Next line if we aren't processing this section
+    test $process -eq 0 && continue
+
+    case "$line" in
+        dir:*)     cmd=$( dodir "${line#*dir:}" ) ;;
+        link:*)    cmd=$( dolink "${line#*link:}"  ) ;;
+        pkg:*)     cmd=$( dopkg "${line#*pkg:}" ) ;;
+        vimplug:*) cmd=$( dovimplug "${line#*vimplug:}" ) ;;
+        repo:*)    cmd=$( dorepo "${line#*repo:}" ) ;;
+        *)
+            logerror "WARNING: Unknown INI directive: <$line>"
+            continue
+            ;;
+    esac
+    test -z "$cmd" && continue # invalid directive
+    to_exec="$to_exec$cmd;;"
+
+done < $INIFILE
+
+# Execute the commands
+echo "$to_exec" | sed -e 's/;;/\n/g' | sed -e 's/^\s*//' | while read k; do
+    # strip I/O redirects to make output cleaner
+    logmsg $( echo $k | sed -e 's@\s*>\s*/dev/null@@' )
+    eval $k
+done
+#}
+
