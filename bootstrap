@@ -63,6 +63,7 @@ Conduct simple, single machine deployment.
   -e            print an example configuration file
   -D            install Dropbox
   -V            explain what is being done
+  -x            print what would be done without executing (implies -V)
   -h            display this help and exit
   -v            output version information and exit
 END
@@ -301,8 +302,9 @@ VIMPLUGDIR=".vim/pack/plugins/start"
 INIFILE="$( pwd )/bootstrap.ini"
 INSTALLDROPBOX='no'
 VERBOSE='no'
+DRYRUN=0
 
-while getopts 'n:d:b:r:p:i:eDVhv' opt; do
+while getopts 'n:d:b:r:p:i:eDVhvx' opt; do
     case $opt in
         'n') HOST=$OPTARG ;;
         'd') DESTDIR=$OPTARG ;;
@@ -315,6 +317,7 @@ while getopts 'n:d:b:r:p:i:eDVhv' opt; do
         'V') VERBOSE='yes' ;;
         'h') print_help; exit ;;
         'v') print_version; exit ;;
+        'x') DRYRUN=1; VERBOSE='yes' ;;
         *)   print_help; exit ;;
     esac
 done
@@ -513,7 +516,9 @@ done < $INIFILE
 echo "$to_exec" | sed -e 's/;;/\n/g' | sed -e 's/^\s*//' | while read k; do
     # strip I/O redirects to make output cleaner
     logmsg $( echo $k | sed -e 's@\s*>\s*/dev/null@@' )
-    eval $k
+    if test $DRYRUN -eq 0; then
+        eval $k
+    fi
 done
 #}
 
