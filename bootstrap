@@ -19,7 +19,7 @@
 #           Python CLI and systemd service
 #         - Creating directories
 #         - Creating symbolic links
-#         - Installing packages (supports apt).
+#         - Installing packages (supports apt and dnf).
 #           Packages are installed using 'sudo' and assume that
 #           all prompts are accepted
 #         - Cloning source repositories (supports Github repositories).
@@ -31,7 +31,7 @@
 # REQUIREMENTS:
 #     - getopts
 #     - curl or wget (installs curl if necessary)
-#     - apt-get (to install packages)
+#     - apt-get or dnf (to install packages)
 #     - git (to install git repos; installed if necessary)
 #
 # BUGS:
@@ -89,7 +89,7 @@ print_example () {
     dir: documents/local # Create documents/local
     link: Dropbox/src src # Create a symlink named src
                           # pointing to Dropbox/src
-    pkg: git # Install git package. Requires apt-get
+    pkg: git # Install git package. Requires apt-get or dnf
     pkg: tmux screen # Install tmux and screen
 
     # repo: syntax is:
@@ -139,13 +139,16 @@ logerror () {
 get_pkg_install_cmd () {
     # Return command to install packages
     #
-    # Supports: apt
+    # Supports: apt, dnf 
     #
     # Return '' if no supported command found
 
     if type apt > /dev/null 2>&1; then
         test "$VERBOSE" = 'no' && quiet='-q'
         echo "sudo apt-get install --assume-yes $quiet"
+    elif type dnf > /dev/null 2>&1; then
+        test "$VERBOSE" = 'no' && quiet='-q'
+        echo "sudo dnf install --assumeyes $quiet"
     else
         echo # no command found
     fi
@@ -340,7 +343,7 @@ logmsg "Installing scripts into $BINDIR."
 logmsg "Installing source repositories into $REPODIR."
 logmsg "Installing vim plugins into $VIMPLUGDIR."
 
-INSTALLPKG=$( get_pkg_install_cmd) # How to install packages
+INSTALLPKG=$(get_pkg_install_cmd) # How to install packages
 if test -z "$INSTALLPKG"; then
     logerror "WARNING: Couldn't find a way to install packages."
 else
@@ -407,7 +410,7 @@ dorepo () {
             echo -n "(cd $DESTDIR/$REPODIR; git clone $repo >/dev/null"
             ;;
         *)
-            logerror "WARNING: Unknown repo type <$type>. Skipping <$repo>."
+            logerror "WARNING: Unknown repo type <${type// /}>. Skipping <${repo// /}>."
             return
             ;;
     esac
@@ -449,7 +452,7 @@ dovimplug () {
             echo -n "(cd $DESTDIR/$VIMPLUGDIR; git clone $repo >/dev/null)"
             ;;
         *)
-            logerror "WARNING: Unknown repo type <$type>. Skipping <$repo>."
+            logerror "WARNING: Unknown repo type <${type// /}>. Skipping <${repo// /}>."
             return
             ;;
     esac
@@ -466,7 +469,7 @@ dopkg () {
 
     # Return '' if we don't know how to install packages
     if test -z "$INSTALLPKG"; then
-        logerror "WARNING: Don't know how to install packages. Skipping <$1>."
+        logerror "WARNING: Don't know how to install packages. Skipping <${1// /}>."
         echo ''
         return
     fi
