@@ -293,7 +293,10 @@ SVC_END
         sudo systemctl start dropbox@$(whoami)
     fi
 }
-# Process options {
+# Initialize and Process options {
+
+umask 027 # rw-r-----
+
 #
 # Flag Variables
 #
